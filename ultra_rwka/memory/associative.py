@@ -12,8 +12,9 @@ from ..projections import LinearProjection
 
 # Helper for stable division
 def _safe_divide(num, den, eps=1e-8):
-    """ Performs safe division: num / (den + eps), ensuring den is positive. """
-    return num / (den.clamp(min=eps)) # Clamp denominator instead of adding eps
+    """ Performs safe division: num / (den + eps), ensuring den is non-negative. """
+    # Clamp denominator to be slightly positive to avoid NaN gradients with den=0
+    return num / den.clamp(min=eps)
 
 class ImplicitDAM(nn.Module):
     """
@@ -27,7 +28,8 @@ class ImplicitDAM(nn.Module):
     2. Compute Addressing Weights (a_j) using Kernel Softmax between k_t and Prototypes (phi_j).
     3. Read/Retrieve Value (r_t) by weighted sum of Buffer contents (B_j) using addressing weights.
     4. Generate Content Projection (m_t) from input/context using Content Network.
-    5. Update Buffer (B_j) using an EMA-like rule based on addressing weights and projected content.
+    5. Update Buffer (B_j) using an EMA-like rule based on addressing weights and projected content (only during training).
+    6. Optionally compute prototype diversity regularization loss.
     """
     _supported_distance_metrics = {'euclidean', 'cosine'}
 
@@ -93,12 +95,15 @@ class ImplicitDAM(nn.Module):
         self._is_lambda_learnable = isinstance(learning_rate, str) and learning_rate.lower() == 'learnable'
         self.factory_kwargs = {'device': device, 'dtype': dtype}
 
+        # --- Input Validation ---
         if self.distance_metric not in self._supported_distance_metrics:
             raise ValueError(f"Unsupported distance_metric: {distance_metric}. Choose from {self._supported_distance_metrics}")
         if self.normalize_keys and self.distance_metric == 'euclidean':
-            warnings.warn("Normalizing keys with Euclidean distance might not be standard practice.")
+            warnings.warn("Normalizing keys with Euclidean distance might have unintended effects on distance scaling.")
         if self.normalize_prototypes and self.distance_metric == 'euclidean':
-            warnings.warn("Normalizing prototypes with Euclidean distance might not be standard practice.")
+            warnings.warn("Normalizing prototypes with Euclidean distance might have unintended effects on distance scaling.")
+        if num_bins <= 0:
+            raise ValueError("num_bins must be positive.")
 
         combined_input_dim = input_dim + context_dim
 
@@ -118,61 +123,69 @@ class ImplicitDAM(nn.Module):
 
         # --- Memory Buffer (B_j) ---
         buffer_tensor = torch.zeros(num_bins, value_dim, **self.factory_kwargs)
+        # Register as buffer - its state is updated manually in `write`
         self.register_buffer('buffer', buffer_tensor) # Shape: (N_b, value_dim)
 
         # --- Temperature (tau) ---
         if self._is_temp_learnable:
-            init_val = math.log(math.exp(max(temperature_init, 1e-6)) - 1) # Inverse softplus
+            # Initialize parameter before softplus such that softplus(param) ~= temperature_init
+            init_val = math.log(math.exp(max(temperature_init, 1e-6)) - 1.0)
             self.temperature_param = nn.Parameter(torch.tensor(init_val, **self.factory_kwargs))
         else:
             if not isinstance(temperature, (float, int)) or temperature <= 0:
                  raise ValueError("Fixed temperature must be a positive float.")
+            # Store fixed value directly as buffer
             self.register_buffer('temperature_val', torch.tensor(float(temperature), **self.factory_kwargs))
 
         # --- Learning Rate (lambda) ---
         if self._is_lambda_learnable:
-             init_val = math.log(learning_rate_init / (1.0 - learning_rate_init)) if 0 < learning_rate_init < 1 else 0.0 # Inverse sigmoid
+             # Initialize parameter before sigmoid such that sigmoid(param) ~= learning_rate_init
+             clamped_init = max(min(learning_rate_init, 1.0 - 1e-6), 1e-6) # Clamp init to (eps, 1-eps)
+             init_val = math.log(clamped_init / (1.0 - clamped_init))
              self.learning_rate_param = nn.Parameter(torch.tensor(init_val, **self.factory_kwargs))
         else:
              if not isinstance(learning_rate, (float, int)) or not (0.0 <= learning_rate <= 1.0):
                  raise ValueError("Fixed learning_rate must be a float in [0, 1]")
+             # Store fixed value directly as buffer
              self.register_buffer('learning_rate_val', torch.tensor(float(learning_rate), **self.factory_kwargs))
 
     def get_temperature(self) -> torch.Tensor:
-        """ Returns the current temperature value (scalar tensor). """
+        """ Returns the current temperature value (positive scalar tensor). """
         if self._is_temp_learnable:
-            # Add epsilon to prevent temperature from becoming exactly zero
+            # Softplus ensures positivity. Add epsilon for safety.
             return F.softplus(self.temperature_param) + 1e-6
         else:
+            # Return buffer value directly
             return self.temperature_val
 
     def get_learning_rate(self) -> torch.Tensor:
-        """ Returns the current learning rate value (scalar tensor). """
+        """ Returns the current learning rate value (scalar tensor in [0, 1] if constrained). """
         if self._is_lambda_learnable:
             if self.constrain_lambda:
                 # Sigmoid keeps lambda in (0, 1)
                 return torch.sigmoid(self.learning_rate_param)
             else:
-                # Return raw parameter if constraint is disabled
+                # Return raw parameter if constraint is disabled (user must ensure validity)
                 return self.learning_rate_param
         else:
+            # Return buffer value directly
             return self.learning_rate_val
 
     def _create_mlp(self, in_dim: int, out_dim: int, num_layers: int = 1, hidden_dim: Optional[int] = None, activation_cls: Type[nn.Module] = nn.GELU, **kwargs) -> nn.Sequential:
-        """ Helper to create simple MLPs using LinearProjection """
+        """ Helper to create simple MLPs using LinearProjection. """
         _hidden_dim = hidden_dim if hidden_dim is not None else max(in_dim // 2, out_dim)
         layers = []
         current_dim = in_dim
-        # Pass relevant kwargs from config dict
+        # Get relevant kwargs for LinearProjection from the config dict
         proj_kwargs = {k: v for k, v in kwargs.items() if k in ['use_bias', 'initialize']}
-        proj_kwargs.update(self.factory_kwargs)
+        proj_kwargs.update(self.factory_kwargs) # Add device/dtype
 
         for i in range(num_layers):
             is_last = (i == num_layers - 1)
             layer_out_dim = out_dim if is_last else _hidden_dim
             layers.append(LinearProjection(
                 current_dim, layer_out_dim,
-                activation_cls=None if is_last else activation_cls,
+                activation_cls=None if is_last else activation_cls, # No activation on final layer
                 initialize=proj_kwargs.get('initialize', 'xavier_uniform'), # Default init
                 use_bias=proj_kwargs.get('use_bias', True),
                 device=proj_kwargs.get('device'),
@@ -182,50 +195,45 @@ class ImplicitDAM(nn.Module):
         return nn.Sequential(*layers)
 
     def _initialize_prototypes(self, method: str) -> torch.Tensor:
-        """ Initialize prototype vectors. """
+        """ Initialize prototype vectors phi_j. """
         if method == 'randn':
-            tensor = torch.randn(self.num_bins, self.key_dim, **self.factory_kwargs)
-            nn.init.normal_(tensor, mean=0.0, std=0.02) # Small std deviation
+            tensor = torch.empty(self.num_bins, self.key_dim, **self.factory_kwargs)
+            # Initialize with small std deviation, similar to nn.Linear default bias init range
+            std = 1.0 / math.sqrt(self.key_dim)
+            nn.init.normal_(tensor, mean=0.0, std=std)
         elif method == 'uniform':
+            tensor = torch.empty(self.num_bins, self.key_dim, **self.factory_kwargs)
             bound = 1.0 / math.sqrt(self.key_dim)
-            tensor = torch.rand(self.num_bins, self.key_dim, **self.factory_kwargs) * 2 * bound - bound
+            nn.init.uniform_(tensor, -bound, bound)
         else:
             raise ValueError(f"Unknown prototype_init method: {method}. Choose 'randn' or 'uniform'.")
         return tensor
 
     def _compute_distances(self, query_key: torch.Tensor) -> torch.Tensor:
         """ Computes distances between query keys and prototypes. """
-        # query_key: (B, key_dim)
-        # prototypes: (N_b, key_dim) -> Could be Parameter or Buffer
-
         # Normalize if requested
         q = F.normalize(query_key, p=2, dim=-1) if self.normalize_keys else query_key
-        p = F.normalize(self.prototypes, p=2, dim=-1) if self.normalize_prototypes else self.prototypes
-
-        # Expand dims for broadcasting: query (B, 1, D), prototypes (1, N, D) -> (N, D) for cdist
-        q_exp = q.unsqueeze(1) # (B, 1, D)
-        p_for_cdist = p # (N, D)
+        # Detach prototypes during normalization if they are learnable but normalization shouldn't affect their gradients directly
+        p_maybe_detached = self.prototypes.detach() if self.learnable_prototypes else self.prototypes
+        p_normalized = F.normalize(p_maybe_detached, p=2, dim=-1)
+        p = p_normalized if self.normalize_prototypes else self.prototypes # Use normalized or original based on flag
 
         if self.distance_metric == 'euclidean':
-            # Use torch.cdist for potentially better efficiency/stability
-            # cdist computes pairwise distances: output (B, N)
-            # p=2 gives Euclidean distance. Square it for squared Euclidean.
-            distances = torch.cdist(q, p_for_cdist, p=2).pow(2) # (B, N)
+            # Squared Euclidean distance using torch.cdist
+            distances = torch.cdist(q, p, p=2).pow(2) # (B, N)
         elif self.distance_metric == 'cosine':
             # Cosine distance = 1 - cosine_similarity
-            # Ensure inputs are normalized if using cosine distance for meaningful results
+            # Ensure inputs are normalized if using cosine distance
             if not (self.normalize_keys and self.normalize_prototypes):
                  warnings.warn("Using cosine distance without normalizing keys and prototypes.")
-            # Compute similarity: (B, D) @ (D, N) -> (B, N)
-            sim = torch.matmul(q, p_for_cdist.t())
-            distances = 1.0 - sim # Range approx [0, 2]
+            sim = torch.matmul(q, p.t()) # (B, Dk) @ (Dk, N) -> (B, N)
+            distances = 1.0 - sim
         else:
+            # Should be caught by __init__ but check defensively
             raise NotImplementedError(f"Distance metric {self.distance_metric} not implemented.")
 
-        # Clamp minimum distance only for Euclidean to avoid issues with exp(-dist/temp) if dist is tiny negative due to float errors
-        if self.distance_metric == 'euclidean':
-             distances = torch.clamp(distances, min=0.0)
-
+        # Clamp minimum distance for stability, esp. for Euclidean
+        distances = torch.clamp(distances, min=0.0)
         return distances # Shape: (B, N)
 
     def compute_addressing(self, query_key: torch.Tensor) -> torch.Tensor:
@@ -236,15 +244,11 @@ class ImplicitDAM(nn.Module):
         # Kernel Softmax: exp(-distance / tau) / sum(exp(-distance / tau))
         scaled_neg_distances = -distances / temperature # (B, N)
 
-        # Use log-softmax for numerical stability, then exponentiate
+        # Use log-softmax for numerical stability
         log_probs = F.log_softmax(scaled_neg_distances, dim=-1) # (B, N)
         attention_weights = torch.exp(log_probs) # (B, N)
-
-        # # Alternative stable softmax (manual)
-        # max_val = torch.max(scaled_neg_distances, dim=-1, keepdim=True)[0]
-        # exp_val = torch.exp(scaled_neg_distances - max_val.detach()) # Detach max_val for stability?
-        # sum_exp_val = torch.sum(exp_val, dim=-1, keepdim=True)
-        # attention_weights = _safe_divide(exp_val, sum_exp_val)
+        # Ensure weights sum to 1 (within float precision)
+        # attention_weights = attention_weights / attention_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         return attention_weights # a_jmem
 
@@ -252,6 +256,10 @@ class ImplicitDAM(nn.Module):
         """ Reads from the memory buffer using the query key. """
         attention_weights = self.compute_addressing(query_key) # (B, N)
         buffer_state = self.buffer # (N, V)
+        # Ensure buffer dtype matches attention weights if needed (e.g., for AMP)
+        if buffer_state.dtype != attention_weights.dtype:
+             buffer_state = buffer_state.to(attention_weights.dtype)
+
         # einsum: 'bn,nv->bv' (batch, bins) @ (bins, value_dim) -> (batch, value_dim)
         retrieved_value = torch.einsum('bn,nv->bv', attention_weights, buffer_state) # (B, V)
         return retrieved_value, attention_weights
@@ -259,11 +267,9 @@ class ImplicitDAM(nn.Module):
     def write(self, attention_weights: torch.Tensor, content_projection: torch.Tensor):
         """
         Updates the memory buffer using a batch-averaged EMA-like rule.
-
-        Interpretation of paper's formula B_j,t = (1 - lambda*a_bj)*B_j,t-1 + lambda*a_bj*m_t
-        for batch processing: Update buffer B_j based on the average contribution
-        from batch items, weighted by their attention a_bj to bin j.
-        B_j_new = B_j_old * (1 - avg_j[lambda*a_bj]) + avg_j[lambda*a_bj*m_b]
+        This interprets the paper's formula for batch processing by averaging
+        the update contribution across the batch for each memory bin.
+        Update occurs in-place on self.buffer.
         """
         B, N = attention_weights.shape
         _N, V = self.buffer.shape
@@ -273,43 +279,55 @@ class ImplicitDAM(nn.Module):
 
         effective_lambda = self.get_learning_rate() # Scalar tensor
 
-        # Calculate batch-averaged update components
-        with torch.no_grad(): # Avoid tracking gradients for buffer update calculations if buffer isn't param
-            # Average write gate per bin (how much each bin is updated on average)
-            avg_write_gate_j = (effective_lambda * attention_weights).mean(dim=0) # Shape (N,)
+        # --- Batch-Averaged Update Calculation ---
+        # This calculation should not be part of the autograd graph w.r.t the buffer state itself,
+        # only w.r.t parameters used to compute attention_weights and content_projection.
+        with torch.no_grad():
+            # Ensure calculation happens on the correct device/dtype
+            current_buffer = self.buffer.to(device=attention_weights.device, dtype=attention_weights.dtype)
+            content = content_projection.to(dtype=current_buffer.dtype)
+            attn = attention_weights.to(dtype=current_buffer.dtype)
+            eff_lambda = effective_lambda.to(dtype=current_buffer.dtype)
+
+            # Average write gate per bin
+            avg_write_gate_j = (eff_lambda * attn).mean(dim=0) # Shape (N,)
 
             # Average content weighted by write gate per bin
-            write_signal = effective_lambda * attention_weights # (B, N)
-            # einsum 'bn,bv->nv': computes Sum_b[ write_signal_bj * content_b ] for each bin j
-            sum_weighted_content_j = torch.einsum('bn,bv->nv', write_signal, content_projection) # (N, V)
+            write_signal = eff_lambda * attn # (B, N)
+            sum_weighted_content_j = torch.einsum('bn,bv->nv', write_signal, content) # (N, V)
             # Average over batch size B
             avg_weighted_content_j = sum_weighted_content_j / B # (N, V)
 
             # Apply EMA Update
-            current_buffer = self.buffer # (N, V)
-            forget_mult = (1.0 - avg_write_gate_j).unsqueeze(-1) # (N, 1)
-            # Clamp forget multiplier to avoid negative values if lambda or attention is unstable
-            forget_mult = torch.clamp(forget_mult, min=0.0)
+            forget_mult = (1.0 - avg_write_gate_j).unsqueeze(-1).clamp_(min=0.0) # (N, 1), clamp for stability
+            write_mult = avg_weighted_content_j # (N, V)
 
-            new_buffer = forget_mult * current_buffer + avg_weighted_content_j # (N, V)
+            new_buffer = forget_mult * current_buffer + write_mult # (N, V)
 
             # Update buffer state in-place using copy_
             self.buffer.data.copy_(new_buffer)
 
     def calculate_prototype_regularization(self) -> Optional[torch.Tensor]:
         """ Calculates the prototype diversity regularization loss. """
-        if self.learnable_prototypes and self.prototype_reg_coeff > 0.0 and self.training:
-            if self.num_bins <= 1: return None
+        # Only compute during training if enabled and prototypes are learnable
+        if not (self.learnable_prototypes and self.prototype_reg_coeff > 0.0 and self.training):
+            return None
+        if self.num_bins <= 1:
+            return None # No pairs to compare
 
-            # Use cosine similarity for regularization penalty
-            protos_norm = F.normalize(self.prototypes, p=2, dim=-1) # (N, Dk)
-            sim_matrix = torch.matmul(protos_norm, protos_norm.t()) # (N, N)
-            # Penalize squared similarity in upper triangle (excluding diagonal)
-            upper_tri_sim_sq = torch.triu(sim_matrix, diagonal=1).pow(2)
-            num_pairs = self.num_bins * (self.num_bins - 1) / 2
-            reg_loss = torch.sum(upper_tri_sim_sq) / max(num_pairs, 1.0) # Avoid div by zero
-            return reg_loss * self.prototype_reg_coeff
-        return None
+        # Use cosine similarity for regularization penalty
+        protos = self.prototypes # (N, Dk)
+        protos_norm = F.normalize(protos, p=2, dim=-1)
+        sim_matrix = torch.matmul(protos_norm, protos_norm.t()) # (N, N)
+
+        # Penalize squared similarity in upper triangle (excluding diagonal)
+        upper_tri_sim_sq = torch.triu(sim_matrix, diagonal=1).pow(2)
+        num_pairs = self.num_bins * (self.num_bins - 1) / 2
+        # Use safe divide in case num_bins=1 (though checked above)
+        avg_sim_sq = torch.sum(upper_tri_sim_sq) / max(num_pairs, 1.0)
+
+        reg_loss = avg_sim_sq * self.prototype_reg_coeff
+        return reg_loss
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -328,8 +346,8 @@ class ImplicitDAM(nn.Module):
         # 1. Prepare combined input for networks
         if x.shape[0] != context.shape[0]:
              raise ValueError(f"Batch size mismatch: x {x.shape[0]}, context {context.shape[0]}")
-        # Ensure types match for concatenation
-        expected_dtype = self.key_net[0].linear.weight.dtype # Get dtype from first layer
+        # Ensure types match for concatenation and networks
+        expected_dtype = next(self.key_net.parameters()).dtype # Get dtype from key_net
         if x.dtype != expected_dtype: x = x.to(dtype=expected_dtype)
         if context.dtype != expected_dtype: context = context.to(dtype=expected_dtype)
         combined_input = torch.cat([x, context], dim=-1) # (B, input_dim + context_dim)
@@ -338,33 +356,46 @@ class ImplicitDAM(nn.Module):
         query_key = self.key_net(combined_input) # (B, key_dim)
 
         # 3. Read from Memory
+        # Ensure query key dtype matches prototype dtype for distance calc
+        if query_key.dtype != self.prototypes.dtype:
+             query_key = query_key.to(dtype=self.prototypes.dtype)
         retrieved_value, attention_weights = self.read(query_key) # r_t (B, V), a_j (B, N)
 
         # 4. Generate Content Projection
         content_projection = self.content_net(combined_input) # m_t (B, V)
 
         # 5. Write to Memory (update buffer state)
-        # Only update during training or if explicitly needed during inference (usually not)
+        # Only update during training by default
         if self.training:
+            # Ensure dtypes match for write operation
+            if attention_weights.dtype != self.buffer.dtype:
+                attention_weights = attention_weights.to(dtype=self.buffer.dtype)
+            if content_projection.dtype != self.buffer.dtype:
+                content_projection = content_projection.to(dtype=self.buffer.dtype)
             self.write(attention_weights, content_projection)
 
         # 6. Calculate optional prototype regularization loss
         reg_loss = self.calculate_prototype_regularization()
 
-        # 7. Return the retrieved value and regularization loss
-        return retrieved_value, reg_loss # r_t
+        # 7. Return the retrieved value (ensure original dtype) and regularization loss
+        return retrieved_value.to(dtype=x.dtype), reg_loss # r_t
 
     def extra_repr(self) -> str:
         s = (f"key_dim={self.key_dim}, value_dim={self.value_dim}, num_bins={self.num_bins}, "
              f"distance_metric='{self.distance_metric}'\n")
         s += f"  normalize_keys={self.normalize_keys}, normalize_prototypes={self.normalize_prototypes}\n"
         s += f"  learnable_prototypes={self.learnable_prototypes}, prototype_init='{self.prototype_init}'\n"
-        # Safely get tensor value for display if not learnable
-        temp_val_tensor = self.get_temperature()
-        temp_val = f"{temp_val_tensor.item():.4f}" if temp_val_tensor.numel() == 1 else "Tensor"
+        # Get scalar value for display if possible
+        try:
+            temp_val_tensor = self.get_temperature()
+            temp_val = f"{temp_val_tensor.item():.4f}" if temp_val_tensor.numel() == 1 else "Tensor"
+        except: temp_val = "Error" # Handle case where param might not be initialized yet
         temp_status = "(learnable)" if self._is_temp_learnable else "(fixed)"
-        lambda_val_tensor = self.get_learning_rate()
-        lambda_val = f"{lambda_val_tensor.item():.4f}" if lambda_val_tensor.numel() == 1 else "Tensor"
+
+        try:
+            lambda_val_tensor = self.get_learning_rate()
+            lambda_val = f"{lambda_val_tensor.item():.4f}" if lambda_val_tensor.numel() == 1 else "Tensor"
+        except: lambda_val = "Error"
         lambda_status = "(learnable, constrained)" if self._is_lambda_learnable and self.constrain_lambda else \
                         "(learnable, unconstrained)" if self._is_lambda_learnable else "(fixed)"
         s += f"  temperature(tau)={temp_val} {temp_status}, learning_rate(lambda)={lambda_val} {lambda_status}\n"
@@ -394,7 +425,7 @@ if __name__ == '__main__':
         key_dim=D_key,
         value_dim=D_val,
         num_bins=N_bins,
-        key_net_config={'num_layers': 2, 'hidden_dim': 64},
+        key_net_config={'num_layers': 2, 'hidden_dim': 64, 'activation_cls': nn.GELU}, # Pass activation
         content_net_config={'num_layers': 1},
         learnable_prototypes=True,
         prototype_init='randn',
@@ -414,7 +445,7 @@ if __name__ == '__main__':
     x_t = torch.randn(B, D_in, device=device, dtype=dtype)
     h_prev = torch.randn(B, D_ctx, device=device, dtype=dtype)
 
-    # --- Forward pass (Read-then-Write) ---
+    # --- Forward pass (training mode) ---
     print("\nRunning forward pass (training mode)...")
     # Set to train mode to compute regularization and perform write
     idam_memory.train()
@@ -445,8 +476,8 @@ if __name__ == '__main__':
     assert reg_loss_eval is None
     # Check buffer didn't change
     buffer_after_eval = idam_memory.buffer
-    print("Buffer changed after eval forward:", not torch.allclose(buffer_after_train_write, buffer_after_eval))
-    assert torch.allclose(buffer_after_train_write, buffer_after_eval)
+    print("Buffer changed after eval forward:", not torch.allclose(buffer_after_train_write, buffer_after_eval, atol=1e-6)) # Use tolerance for float comparison
+    assert torch.allclose(buffer_after_train_write, buffer_after_eval, atol=1e-6)
 
 
     # --- Test Read Separately ---
@@ -462,5 +493,4 @@ if __name__ == '__main__':
     assert a_read.shape == (B, N_bins)
     print("Read Attention sample (sum should be 1):", a_read[0, :8].detach().cpu().numpy())
     print("Attention sum check:", a_read.sum(dim=-1).mean().item()) # Should be close to 1
-
 
