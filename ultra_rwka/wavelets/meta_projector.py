@@ -1,4 +1,4 @@
-# ultra_rwka/components/wavelets/meta_projector.py
+# ultra_rwka/components/wavelets/meta_projector.py (Modified Forward Pass)
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,10 @@ from typing import Optional, Type, Union
 from ..projections import LinearProjection
 # Correct relative path for backend interface
 from ...backend.interface import wavelet_projection
+# Import utility from the revised bases.py
+from .bases import normalize_filters # <<<--- ADD THIS IMPORT
 
+# MetaNetW class remains the same...
 class MetaNetW(nn.Module):
     """
     Meta-Network (e.g., MLP) that generates wavelet parameters (theta_W)
@@ -69,18 +72,18 @@ class MetaNetW(nn.Module):
             context = context.to(dtype=expected_dtype)
         return self.network(context)
 
-
 class MetaWaveletProjector(nn.Module):
     """
     Performs adaptive multi-resolution analysis using meta-learned wavelet projections.
 
     Generates time-varying wavelet parameters (theta_W) using MetaNetW based on context,
-    derives filters from these parameters, and then projects the input signal using
-    these dynamic filters via a backend call.
+    derives filters from these parameters (including normalization), and then projects
+    the input signal using these dynamic filters via a backend call.
 
     Currently implements 'direct_fir' parameterization where MetaNetW directly
     outputs the filter coefficients.
     """
+    # __init__ method remains the same...
     def __init__(self,
                  input_dim: int, # Dimension of input signal x_t
                  output_dim: int, # Dimension of output wavelet coefficient vector W_t
@@ -138,21 +141,15 @@ class MetaWaveletProjector(nn.Module):
             **self.factory_kwargs
         )
 
-        # Note: The backend `wavelet_projection` determines the actual number of
-        # output coefficients based on the input signal length, filters, strides, etc.
-        # We assume here that the backend configuration results in `output_dim` coefficients.
-        # This might require careful coordination between Python config and backend implementation.
-
-
+    # Forward method is MODIFIED
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        Generate dynamic filters and project the input signal.
+        Generate dynamic filters, normalize them, and project the input signal.
 
         Args:
             x (torch.Tensor): Input signal tensor of shape (Batch, SeqLen, input_dim).
             context (torch.Tensor): Context tensor for MetaNetW. Shape should be compatible,
-                                     e.g., (Batch, SeqLen, context_dim) for time-varying filters,
-                                     or (Batch, context_dim) for time-invariant filters per batch item.
+                                     e.g., (Batch, SeqLen, context_dim) or (Batch, context_dim).
 
         Returns:
             torch.Tensor: Output wavelet coefficient tensor W_t of shape (Batch, SeqLen, output_dim).
@@ -163,63 +160,44 @@ class MetaWaveletProjector(nn.Module):
         B, T, D_in = x.shape
         Ctx_dim = context.shape[-1]
 
-        # Check context dimension
         if Ctx_dim != self.context_dim:
              raise ValueError(f"Context last dim ({Ctx_dim}) doesn't match expected context_dim ({self.context_dim})")
 
-        # Handle context shape: Assume time-varying context (B, T, Ctx) for now
-        # If context is (B, Ctx), expand it to (B, T, Ctx)
-        if context.ndim == 2 and context.shape[0] == B: # Shape (B, Ctx)
-             context = context.unsqueeze(1).expand(-1, T, -1) # -> (B, T, Ctx)
-        elif context.shape[:-1] != x.shape[:-1]: # Check if batch and time dims match
+        if context.ndim == 2 and context.shape[0] == B:
+             context = context.unsqueeze(1).expand(-1, T, -1)
+        elif context.shape[:-1] != x.shape[:-1]:
              raise ValueError(f"Context shape {context.shape} is not compatible with input shape {x.shape}")
 
-        # Apply dropout to input signal
         x = self.dropout(x)
 
-        # 1. Generate Wavelet Parameters (theta_W) using MetaNetW
-        # theta_W shape: (B, T, parameter_dim)
-        theta_W = self.meta_net_w(context)
+        # 1. Generate Wavelet Parameters (theta_W)
+        theta_W = self.meta_net_w(context) # Shape: (B, T, parameter_dim)
 
-        # 2. Derive Filters from Parameters
+        # 2. Derive and Normalize Filters
         if self.parameterization_type == 'direct_fir':
-            # Reshape theta_W directly into filter coefficients
-            # Expected filter shape by backend needs confirmation. Common conventions:
-            # (Batch, NumFilters, FilterLength) or (Batch, InChannels, OutChannels, FilterLength) etc.
-            # Assuming backend handles batch of time-varying filters:
-            # Reshape theta_W (B, T, NumFilters * FilterLength) -> (B*T, NumFilters, FilterLength)
             try:
-                filters = theta_W.view(B * T, self.num_filters, self.filter_length)
+                # Reshape raw coefficients: (B, T, NumF*FiltL) -> (B*T, NumF, FiltL)
+                raw_filters = theta_W.view(B * T, self.num_filters, self.filter_length)
             except RuntimeError as e:
                  print(f"Error reshaping theta_W {theta_W.shape} to filters "
                        f"({B*T}, {self.num_filters}, {self.filter_length}). Parameter dim mismatch?")
                  raise e
-            # TODO: Consider filter normalization here if needed (e.g., L2 norm per filter)
+
+            # <<<--- Normalize the filters using the utility function --- >>>
+            filters = normalize_filters(raw_filters)
 
         else:
-             # Should be caught by __init__
              raise NotImplementedError(f"Filter derivation for '{self.parameterization_type}' not implemented.")
 
         # 3. Prepare Input for Backend Projection
-        # Backend `wavelet_projection` expects (input, filters).
-        # Input shape needs to match backend expectation. Assuming 1D convolution style:
-        # Reshape x (B, T, D_in) -> (B*T, D_in) or perhaps (B*T, 1, D_in) if channels are expected.
-        # Let's assume (B*T, D_in) for now.
-        x_reshaped = x.reshape(B * T, D_in)
+        x_reshaped = x.reshape(B * T, D_in) # Shape: (B*T, D_in)
 
         # 4. Call Backend Wavelet Projection
-        # ASSUMPTION: The backend `wavelet_projection(input, filters)` handles
-        # the batch dimension (B*T) for both input and filters, performs the
-        # projection (like convolution or inner product), and returns coefficients
-        # with shape (B*T, output_dim).
-        # The exact nature of the projection (convolution, decomposition levels, etc.)
-        # is determined by the backend implementation.
         try:
-            # Ensure contiguity
             x_reshaped = x_reshaped.contiguous()
-            filters = filters.contiguous()
+            filters = filters.contiguous() # Use normalized filters
 
-            # Call the backend function
+            # Backend takes normalized filters
             wavelet_coeffs = wavelet_projection(x_reshaped, filters) # Expected output: (B*T, output_dim)
 
         except ImportError:
@@ -229,29 +207,26 @@ class MetaWaveletProjector(nn.Module):
              print("Check backend kernel implementation and input shapes/types.")
              raise e
         except NotImplementedError as e:
-             # Catch if the backend binding itself raises NotImplementedError
              print(f"Backend function wavelet_projection reported as not implemented: {e}")
              raise e
-
 
         # 5. Validate and Reshape Output
         if wavelet_coeffs.shape != (B * T, self.output_dim):
              warnings.warn(f"Backend output shape {wavelet_coeffs.shape} does not match expected "
                            f"({B*T}, {self.output_dim}). Check backend implementation and output_dim config.")
-             # Attempt to reshape anyway, might fail
              try:
                  output = wavelet_coeffs.view(B, T, -1)
-                 # If reshape works but last dim is wrong, adjust or raise
                  if output.shape[-1] != self.output_dim:
                       raise ValueError("Backend output dimension mismatch after reshaping.")
              except RuntimeError as e:
                   print("Failed to reshape backend output.")
                   raise e
         else:
-             output = wavelet_coeffs.view(B, T, self.output_dim) # Reshape back to (B, T, output_dim)
+             output = wavelet_coeffs.view(B, T, self.output_dim)
 
         return output
 
+    # extra_repr remains the same...
     def extra_repr(self) -> str:
         s = f"input_dim={self.input_dim}, output_dim={self.output_dim}, context_dim={self.context_dim}\n"
         s += f"  parameterization={self.parameterization_type}, "
@@ -263,7 +238,7 @@ class MetaWaveletProjector(nn.Module):
         return s.strip()
 
 
-# Example Usage
+# Example Usage (should still work, now uses normalized filters internally)
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -288,7 +263,7 @@ if __name__ == '__main__':
         device=device,
         dtype=dtype
     )
-    print("--- MetaWaveletProjector ---")
+    print("--- MetaWaveletProjector (Updated) ---")
     print(meta_proj)
 
     # Create dummy inputs
@@ -319,5 +294,3 @@ if __name__ == '__main__':
         assert output_ti.shape == (B, T, Out_dim)
     except (ImportError, RuntimeError, NotImplementedError, ValueError) as e:
         print(f"\nCaught expected error (backend/config issue): {e}")
-
-
