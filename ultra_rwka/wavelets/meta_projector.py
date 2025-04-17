@@ -1,5 +1,3 @@
-# ultra_rwka/components/wavelets/meta_projector.py (Modified Forward Pass)
-
 import torch
 import torch.nn as nn
 import math
@@ -11,9 +9,9 @@ from ..projections import LinearProjection
 # Correct relative path for backend interface
 from ...backend.interface import wavelet_projection
 # Import utility from the revised bases.py
-from .bases import normalize_filters # <<<--- ADD THIS IMPORT
+from .bases import normalize_filters
 
-# MetaNetW class remains the same...
+# MetaNetW class remains unchanged
 class MetaNetW(nn.Module):
     """
     Meta-Network (e.g., MLP) that generates wavelet parameters (theta_W)
@@ -81,16 +79,15 @@ class MetaWaveletProjector(nn.Module):
     the input signal using these dynamic filters via a backend call.
 
     Currently implements 'direct_fir' parameterization where MetaNetW directly
-    outputs the filter coefficients.
+    outputs the filter coefficients, with filters organized as lo_d/hi_d pairs.
     """
-    # __init__ method remains the same...
     def __init__(self,
                  input_dim: int, # Dimension of input signal x_t
                  output_dim: int, # Dimension of output wavelet coefficient vector W_t
                  context_dim: int, # Dimension of context input for MetaNetW
                  parameterization_type: str = 'direct_fir',
-                 num_filters: int = 32, # Example: Number of dynamic filters
-                 filter_length: int = 16, # Example: Length of each FIR filter
+                 num_filters: int = 32, # Number of dynamic filters (must be even for lo_d/hi_d pairs)
+                 filter_length: int = 16, # Length of each FIR filter
                  meta_net_hidden_dim: Optional[int] = None,
                  meta_net_layers: int = 2,
                  proj_dropout_p: float = 0.0, # Dropout on input x before projection
@@ -106,6 +103,7 @@ class MetaWaveletProjector(nn.Module):
                                          Currently only 'direct_fir' is implemented.
                                          Defaults to 'direct_fir'.
             num_filters (int): Number of FIR filters to generate if using 'direct_fir'.
+                               Must be even to form lo_d/hi_d pairs.
             filter_length (int): Length of each FIR filter if using 'direct_fir'.
             meta_net_hidden_dim (Optional[int]): Hidden dimension for MetaNetW MLP.
             meta_net_layers (int): Number of layers for MetaNetW MLP. Defaults to 2.
@@ -121,6 +119,10 @@ class MetaWaveletProjector(nn.Module):
         self.num_filters = num_filters
         self.filter_length = filter_length
         self.factory_kwargs = {'device': device, 'dtype': dtype}
+
+        # Enforce even num_filters for lo_d/hi_d pairing
+        if self.num_filters % 2 != 0:
+            raise ValueError(f"num_filters ({self.num_filters}) must be even to form lo_d/hi_d pairs.")
 
         if self.parameterization_type != 'direct_fir':
             # TODO: Implement other parameterizations if needed (e.g., 'analytical_morlet_params')
@@ -141,10 +143,9 @@ class MetaWaveletProjector(nn.Module):
             **self.factory_kwargs
         )
 
-    # Forward method is MODIFIED
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        Generate dynamic filters, normalize them, and project the input signal.
+        Generate dynamic filters, normalize them as lo_d/hi_d pairs, and project the input signal.
 
         Args:
             x (torch.Tensor): Input signal tensor of shape (Batch, SeqLen, input_dim).
@@ -178,13 +179,21 @@ class MetaWaveletProjector(nn.Module):
             try:
                 # Reshape raw coefficients: (B, T, NumF*FiltL) -> (B*T, NumF, FiltL)
                 raw_filters = theta_W.view(B * T, self.num_filters, self.filter_length)
+                # Split into lo_d and hi_d filters (first half lo_d, second half hi_d)
+                num_pairs = self.num_filters // 2
+                lo_d_filters = raw_filters[:, :num_pairs, :] # Shape: (B*T, num_pairs, filter_length)
+                hi_d_filters = raw_filters[:, num_pairs:, :] # Shape: (B*T, num_pairs, filter_length)
             except RuntimeError as e:
                  print(f"Error reshaping theta_W {theta_W.shape} to filters "
                        f"({B*T}, {self.num_filters}, {self.filter_length}). Parameter dim mismatch?")
                  raise e
 
-            # <<<--- Normalize the filters using the utility function --- >>>
-            filters = normalize_filters(raw_filters)
+            # Normalize filters, assuming normalize_filters handles lo_d/hi_d pairing
+            # Note: normalize_filters must ensure lo_d/hi_d satisfy DWT conditions (e.g., quadrature mirror)
+            lo_d_normalized = normalize_filters(lo_d_filters)
+            hi_d_normalized = normalize_filters(hi_d_filters)
+            # Concatenate normalized filters back in order: [lo_d, hi_d]
+            filters = torch.cat([lo_d_normalized, hi_d_normalized], dim=1) # Shape: (B*T, num_filters, filter_length)
 
         else:
              raise NotImplementedError(f"Filter derivation for '{self.parameterization_type}' not implemented.")
@@ -226,19 +235,18 @@ class MetaWaveletProjector(nn.Module):
 
         return output
 
-    # extra_repr remains the same...
     def extra_repr(self) -> str:
         s = f"input_dim={self.input_dim}, output_dim={self.output_dim}, context_dim={self.context_dim}\n"
         s += f"  parameterization={self.parameterization_type}, "
         if self.parameterization_type == 'direct_fir':
-             s += f"num_filters={self.num_filters}, filter_length={self.filter_length}, parameter_dim={self.parameter_dim}\n"
+             s += (f"num_filter_pairs={self.num_filters // 2}, num_filters={self.num_filters}, "
+                   f"filter_length={self.filter_length}, parameter_dim={self.parameter_dim}\n")
         s += f"  (meta_net_w): {self.meta_net_w}"
         if isinstance(self.dropout, nn.Dropout) and self.dropout.p > 0:
              s += f"\n  (dropout): Dropout(p={self.dropout.p})"
         return s.strip()
 
-
-# Example Usage (should still work, now uses normalized filters internally)
+# Example Usage (unchanged, num_filters=8 is already even)
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -247,7 +255,7 @@ if __name__ == '__main__':
     B, T, D_in = 4, 50, 32  # Batch, Time, Input Dim
     Ctx_dim = 64           # Context Dim
     Out_dim = 128          # Output coefficient Dim
-    Num_Filt = 8           # Num filters for 'direct_fir'
+    Num_Filt = 8           # Num filters for 'direct_fir' (even, forms 4 lo_d/hi_d pairs)
     Filt_Len = 16          # Filter length for 'direct_fir' -> Param Dim = 8*16=128
 
     # Create the projector
