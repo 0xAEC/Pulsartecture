@@ -10,8 +10,7 @@
 #include <cuda_fp16.h>
 #include <limits>
 #include <type_traits> // For std::is_same_v
-// Configurable constants
-// Consider making BLOCK_SIZE configurable or tuned based on architecture/problem
+// TODO: Consider making BLOCK_SIZE configurable or tuned based on architecture/problem
 constexpr int IDAM_CUDA_BLOCK_SIZE = 256; 
 constexpr float IDAM_CUDA_EPSILON = 1e-9f; 
 constexpr int TILE_N = 16; 
@@ -27,14 +26,11 @@ using VecLoadStore2 = half2; // Load 2 bytes
 using VecType2 = half2;      // Operate on 2 halves
 };
 #endif
-// --- Utility Functions Namespace ---
 namespace utils {
-// Dynamic Shared Memory Helper (unchanged)
 template <typename T>
 device forceinline T *AsDynamicSharedMemory(unsigned char *ptr) {
 return reinterpret_cast<T *>(ptr);
 }
-// Max Operator (unchanged)
 template <typename scalar_t>
 device forceinline scalar_t CudaMax(scalar_t a, scalar_t b);
 template <> device forceinline float CudaMax<float>(float a, float b) { return fmaxf(a, b); }
@@ -63,7 +59,7 @@ val = CudaMax(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
 }
 return val;
 }
-// Specialization for __half sum to use float accumulation for precision
+// Specialization for __half sum to use float accumulation for precision, meh, maybe needs more precision
 #if defined(CUDA_ARCH) && CUDA_ARCH >= 530
 template <>
 device forceinline __half warp_reduce_sum<__half>(__half val_h) {
@@ -89,8 +85,7 @@ val = warp_reduce_sum(val);
 if (lane_id == 0) {
     shared_reduce_tmp[warp_id] = val;
 }
-__syncthreads(); // Ensure all warp results are written
-
+__syncthreads(); 
 // 3. First warp reduces the results from shared memory
 // Read only if within the number of warps
 val = (lane_id < num_warps) ? shared_reduce_tmp[lane_id] : static_cast<scalar_t>(0.0);
@@ -116,7 +111,6 @@ if (warp_id == 0) {
          // Standard float or other types
          #pragma unroll
          for (int offset = warpSize / 2; offset >= 1; offset /= 2) {
-             // Only reduce within the number of warps active in this step
               if (lane_id < num_warps) { // Check bounds for shuffle source
                 val += __shfl_down_sync(0xFFFFFFFF, val, offset, warpSize);
               }
@@ -124,9 +118,8 @@ if (warp_id == 0) {
          if (lane_id == 0) shared_reduce_tmp[0] = val; // Write final sum
     }
 }
-__syncthreads(); // Ensure final result is written
+__syncthreads(); 
 
-// 4. Broadcast result from shared_reduce_tmp[0] to all threads
 return shared_reduce_tmp[0];
 Use code with caution.
 }
@@ -139,13 +132,11 @@ int warp_id = threadIdx.x / warpSize;
 // 1. Warp-level reduction
 val = warp_reduce_max(val);
 
-// 2. Lane 0 of each warp writes result to shared memory
 if (lane_id == 0) {
     shared_reduce_tmp[warp_id] = val;
 }
-__syncthreads(); // Ensure all warp results are written
+__syncthreads(); 
 
-// 3. First warp reduces the results from shared memory
 scalar_t default_min = -std::numeric_limits<scalar_t>::max();
  if constexpr (std::is_same_v<scalar_t, __half>) {
      default_min = static_cast<scalar_t>(-65504.0f);
@@ -153,7 +144,7 @@ scalar_t default_min = -std::numeric_limits<scalar_t>::max();
 val = (lane_id < num_warps) ? shared_reduce_tmp[lane_id] : default_min;
 
 if (warp_id == 0) {
-    // val = warp_reduce_max(val); // Reduce within the first warp
+    // val = warp_reduce_max(val); 
     #pragma unroll
     for (int offset = warpSize / 2; offset >= 1; offset /= 2) {
          // Only reduce within the number of warps active in this step
@@ -536,7 +527,7 @@ global void idam_update_kernel(
 scalar_t* restrict buffer_ptr,      // Shape (B, Nb, Dv) - To be updated
 const scalar_t* restrict attn_avg_ptr, // Shape (B, Nb) - Per-batch avg attn over T
 const scalar_t* restrict values_avg_ptr, // Shape (B, Dv) - Per-batch avg values over T
-scalar_t* restrict learnable_keys_ptr, // Shape (Nb, Dk) or (B, Nb, Dk) - To be updated ONLY IF NOT SHARED
+scalar_t* restrict learnable_keys_ptr, // Shape (Nb, Dk) or (B, Nb, Dk) - To be updated ONLY IF NOT SHARED --- extremely hard, this is me trying to solve 
 const scalar_t* restrict keys_avg_ptr, // Shape (B, Dk) - Per-batch avg keys over T
 int B, int NumBins, int D_val, int D_key,
 int buffer_stride_B, int buffer_stride_N, int buffer_stride_Dv,
