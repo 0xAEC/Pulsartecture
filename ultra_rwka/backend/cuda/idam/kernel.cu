@@ -1089,7 +1089,6 @@ if (update_lkeys_flag && keys_are_shared) {
     // are queued on the same CUDA stream after the kernel launch and will
     // execute in order on the GPU.
 }
-Use code with caution.
 }
 } // namespace idam
 } // namespace cuda
